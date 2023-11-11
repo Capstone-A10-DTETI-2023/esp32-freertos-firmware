@@ -11,11 +11,26 @@
  
  **/
  
+#define NODEID 1
+#define SENSORID_PR 1
+#define SENSORID_WF 2
+
+#if !( defined(ESP8266) ||  defined(ESP32) )
+  #error This code is intended to run on the ESP8266 or ESP32 platform! Please check your Tools->Board setting.
+#endif
+
+
+
+#define NTP_DBG_PORT                Serial
+// Debug Level from 0 to 4
+#define _NTP_LOGLEVEL_              0
+#define TIME_ZONE_OFFSET_HRS            (+7)
+
 #include <SPI.h>
-#include <EthernetENC.h>
+#include <UIPEthernet.h>
 #include <MQTTPubSubClient_Generic.h>
-#include <NTPClient_Generic.h>
 #include <ArduinoJson.h>
+#include <NTPClient_Generic.h>
  
 // if you don't want to use DNS (and reduce your sketch size)
 // use the numeric IP instead of the name for the server:
@@ -38,8 +53,17 @@ byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 // with the IP address and port of the server
 // that you want to connect to (port 80 is default for HTTP):
 EthernetClient ethClient;
+EthernetUDP udp;
 MQTTPubSubClient mqtt;
- 
+
+unsigned long next;
+
+int pinWFSens = 14;
+volatile long pulse;
+unsigned long lastTime;
+
+NTPClient timeClient(udp);
+
 void setup() {
     Serial.begin(115200);
     delay(1000);
@@ -94,26 +118,59 @@ void setup() {
       Serial.print(".");
     }
     Serial.println("Connected to MQTT!");
+    timeClient.begin();
+    timeClient.setTimeOffset(3600 * TIME_ZONE_OFFSET_HRS);
+    // default 60000 => 60s. Set to once per hour
+    timeClient.setUpdateInterval(SECS_IN_HR);
+  
+    Serial.println("Using NTP Server " + timeClient.getPoolServerName());
   } else {
     // if you didn't get a connection to the server:
     Serial.println("connection failed");
   }
+
+  pinMode(pinWFSens, INPUT);
+  attachInterrupt(digitalPinToInterrupt(pinWFSens), increase, RISING);
 }
  
 void loop() {
-  StaticJsonDocument<200> doc;
+  timeClient.update();
+  String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
+  double pressure = analogRead(27) * 0.033488372093 - 11.3860465116;
+  double volume = 2.663 * pulse / 1000 * 30;
+  if (millis() - lastTime > 2000) {
+    pulse = 0;
+    lastTime = millis();
+  }
+  StaticJsonDocument<200> docPR;
+  StaticJsonDocument<200> docWF;
 
-  doc["timestamp"] = "2023-01-04 15:07:59";
-  doc["node_id"] = "1";
-  doc["sensor_id"] = "1";
-  doc["value"] = "100.5";
+  docPR["timestamp"] = timeDateNowLoc;
+  docPR["node_id"] = NODEID;
+  docPR["sensor_id"] = SENSORID_PR;
+  docPR["value"] = pressure;
 
-  String jsonString;
-  serializeJson(doc, jsonString);
+  docWF["timestamp"] = timeDateNowLoc;
+  docWF["node_id"] = NODEID;
+  docWF["sensor_id"] = SENSORID_WF;
+  docWF["value"] = volume;
+
+  String jsonPRString;
+  serializeJson(docPR, jsonPRString);
+  String jsonWFString;
+  serializeJson(docWF, jsonWFString);
   mqtt.update();
-  mqtt.publish("sensorData", jsonString, false, 0);
+  // mqtt.publish("sensorData", jsonString, false, 0);
   Serial.print("MQTT Connected? ");
   Serial.print(mqtt.isConnected());
   Serial.print("\n");
-  delay(5000);
+
+  Serial.println(jsonPRString);
+  Serial.println(jsonWFString);
+
+  delay(1000);
+}
+
+ICACHE_RAM_ATTR void increase() {
+  pulse++;
 }
