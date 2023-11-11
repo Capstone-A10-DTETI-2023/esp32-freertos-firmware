@@ -12,14 +12,33 @@
  **/
  
 // NODE CONFIG
-#define NODEID            1
-#define SENSORID_PR       1
-#define SENSORID_WF       2
-#define ACTUATORID_PUMP   1
+#define NODEID            3
 #define PRSENSORSAMPLING_INT_MS 100
 #define PRSENSORDATASEND_INT_MS 10000
 #define WFSENSORSAMPLING_INT_MS 1000
 #define WFSENSORDATASEND_INT_MS 10000
+
+#if NODEID == 1
+  const int SENSORID_PR = 1;
+  const int SENSORID_WF = 5;
+  const int ACTUATORID_PUMP = 1;
+  byte mac[] = { 0xD8, 0x00, 0xDF, 0xEF, 0xFE, 0x01 }; // node 1
+#elif NODEID == 2
+  const int SENSORID_PR = 2;
+  const int SENSORID_WF = 6;
+  const int ACTUATORID_PUMP = 2;
+  byte mac[] = { 0xD8, 0x00, 0xDF, 0xEF, 0xFE, 0x02 }; // node 2
+#elif NODEID == 3
+  const int SENSORID_PR = 3;
+  const int SENSORID_WF = 7;
+  const int ACTUATORID_PUMP = 3;
+  byte mac[] = { 0xD8, 0x00, 0xDF, 0xEF, 0xFE, 0x03 }; // node 3
+#elif NODEID == 4
+  const int SENSORID_PR = 4;
+  const int SENSORID_WF = 8;
+  const int ACTUATORID_PUMP = 4;
+  byte mac[] = { 0xD8, 0x00, 0xDF, 0xEF, 0xFE, 0x04 }; // node 4
+#endif
 
 // PIN NUM DEFINITION
 #define PIN_WFLWSENS  14
@@ -53,8 +72,6 @@ IPAddress mqttServer(207,2,123,118);
  
 // Enter a MAC address for your controller below.
 // Newer Ethernet shields have a MAC address printed on a sticker on the shield
-byte mac[] = { 0xD8, 0x00, 0xDF, 0xEF, 0xFE, 0xED };
-
 // Set the static IP address to use if the DHCP fails to assign
 #define MYIPADDR 192,168,1,28
 #define MYIPMASK 255,255,255,0
@@ -139,9 +156,10 @@ void setup() {
    delay(50);
   // if you get a connection, report back via serial:
   if (ethClient.connect(mqttServer, 1883)) {
+    String clientId = "capstone_a10_" + String(rand());
     Serial.println("Connected!");
     mqtt.begin(ethClient);
-    mqtt.connect("arduino", "node", "38t8b4HVHG2cfNr6");
+    mqtt.connect(clientId, "node", "38t8b4HVHG2cfNr6");
     Serial.println("Connecting to MQTT..");
     while(!mqtt.isConnected()) {
       Serial.print(".");
@@ -195,8 +213,18 @@ void Task_ReadPressureSensor(void *pvParams) {
   }
 
   uint counter = 0;
+  double pressure = 0;
   while(1){
-    double pressure = analogRead(PIN_PRESSENS) * 0.05 - 11.5;
+    if( NODEID == 1 ){
+      pressure = analogRead(PIN_PRESSENS) * 0.04375 - 12.925; // node 1
+    } else if ( NODEID == 2 ) {
+      pressure = analogRead(PIN_PRESSENS) * 0.04375 - 11.5125; //node 2
+    } else if ( NODEID == 3 ) {
+      pressure = analogRead(PIN_PRESSENS) * 0.056 - 13.5; // node 3
+    } else if ( NODEID == 4) {
+      pressure = analogRead(PIN_PRESSENS) * 0.05 - 11.2; // node 4
+    }
+
     Serial.println("Current Pressure Sensor Data :" + String(pressure));
     sumPressure += pressure;
     counter++;
@@ -241,10 +269,10 @@ void Task_ReadWaterflowSensor(void *pvParams) {
 }
 
 void Task_CalcAveragePressSens(void *pvParams) {
-  String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
   double *pressDataSum = (double *)pvParams;
   double dataSum;
   while(1) {
+    String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
     if (xSemaphoreTake(xSemaphorePress, portMAX_DELAY)){
       dataSum = sumPressure;
       sumPressure = 0;
@@ -255,21 +283,22 @@ void Task_CalcAveragePressSens(void *pvParams) {
     StaticJsonDocument<200> docPR;
 
     docPR["timestamp"] = timeDateNowLoc;
-    docPR["node_id"] = NODEID;
-    docPR["sensor_id"] = SENSORID_PR;
-    docPR["value"] = aveData;
+    docPR["node_id"] = String(NODEID);
+    docPR["sensor_id"] = String(SENSORID_PR);
+    docPR["value"] = String(aveData);
 
     String jsonPRString;
     serializeJson(docPR, jsonPRString);
+    mqtt.publish(PubTopic, jsonPRString, false, 0);
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
 
 void Task_CalcAverageWFlowSens(void *pvParams) {
-  String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
   double *wFlowDataSum = (double *)pvParams;
   double dataSum;
   while(1){
+    String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
     if (xSemaphoreTake(xSemaphoreWFlow, portMAX_DELAY)){
       dataSum = sumWaterFlow;
       sumWaterFlow = 0;
@@ -280,12 +309,14 @@ void Task_CalcAverageWFlowSens(void *pvParams) {
     StaticJsonDocument<200> docWF;
 
     docWF["timestamp"] = timeDateNowLoc;
-    docWF["node_id"] = NODEID;
-    docWF["sensor_id"] = SENSORID_WF;
-    docWF["value"] = aveData;
+    docWF["node_id"] = String(NODEID);
+    docWF["sensor_id"] = String(SENSORID_WF);
+    docWF["value"] = String(aveData);
 
     String jsonWFString;
     serializeJson(docWF, jsonWFString);
+    mqtt.publish(PubTopic, jsonWFString, false, 0);
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
 
