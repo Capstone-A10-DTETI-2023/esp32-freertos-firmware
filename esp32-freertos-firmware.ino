@@ -11,26 +11,34 @@
  
  **/
  
-#define NODEID 1
-#define SENSORID_PR 1
-#define SENSORID_WF 2
+// NODE CONFIG
+#define NODEID            1
+#define SENSORID_PR       1
+#define SENSORID_WF       2
+#define ACTUATORID_PUMP   1
 
-#if !( defined(ESP8266) ||  defined(ESP32) )
+// PIN NUM DEFINITION
+#define PIN_WFLWSENS  14
+#define PIN_PRESSENS  27
+#define PIN_TEMPSENS  13
+#define PIN_TURBSENS  12
+#define PIN_PUMPACT   26
+
+// NTP CONFIG
+#define NTP_DBG_PORT          Serial
+#define _NTP_LOGLEVEL_        0
+#define TIME_ZONE_OFFSET_HRS  (+7)
+
+// Check Running Platform
+#if !( defined(ESP32) )
   #error This code is intended to run on the ESP8266 or ESP32 platform! Please check your Tools->Board setting.
 #endif
-
-
-
-#define NTP_DBG_PORT                Serial
-// Debug Level from 0 to 4
-#define _NTP_LOGLEVEL_              0
-#define TIME_ZONE_OFFSET_HRS            (+7)
 
 #include <SPI.h>
 #include <UIPEthernet.h>
 #include <MQTTPubSubClient_Generic.h>
-#include <ArduinoJson.h>
 #include <NTPClient_Generic.h>
+#include <ArduinoJson.h>
  
 // if you don't want to use DNS (and reduce your sketch size)
 // use the numeric IP instead of the name for the server:
@@ -55,14 +63,17 @@ byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 EthernetClient ethClient;
 EthernetUDP udp;
 MQTTPubSubClient mqtt;
+NTPClient timeClient(udp);
 
 unsigned long next;
-
-int pinWFSens = 14;
 volatile long pulse;
 unsigned long lastTime;
 
-NTPClient timeClient(udp);
+bool pumpState;
+double pumpValue;
+
+const char* SubTopic = "actuatorData";
+const char* PubTopic = "sensorData"; 
 
 void setup() {
     Serial.begin(115200);
@@ -70,7 +81,7 @@ void setup() {
     Serial.println("Begin Ethernet");
  
     // You can use Ethernet.init(pin) to configure the CS pin
-    Ethernet.init(5);   // MKR ETH Shield
+    Ethernet.init(5);
  
     if (Ethernet.begin(mac)) { // Dynamic IP setup
         Serial.println("DHCP OK!");
@@ -118,6 +129,12 @@ void setup() {
       Serial.print(".");
     }
     Serial.println("Connected to MQTT!");
+    mqtt.subscribe(SubTopic, [](const String & payload, const size_t size)
+    {
+      (void) size;
+
+      controlActuator(payload);
+    });
     timeClient.begin();
     timeClient.setTimeOffset(3600 * TIME_ZONE_OFFSET_HRS);
     // default 60000 => 60s. Set to once per hour
@@ -129,48 +146,99 @@ void setup() {
     Serial.println("connection failed");
   }
 
-  pinMode(pinWFSens, INPUT);
-  attachInterrupt(digitalPinToInterrupt(pinWFSens), increase, RISING);
+  pinMode(PIN_WFLWSENS, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_WFLWSENS), increase, RISING);
+
+  xTaskCreatePinnedToCore(Task_ReadPressureSensor,"Task_ReadPressureSensor",10240,NULL,1,NULL,ARDUINO_RUNNING_CORE);
+  xTaskCreatePinnedToCore(Task_ReadWaterflowSensor,"Task_ReadWaterflowSensor",10240,NULL,1,NULL,ARDUINO_RUNNING_CORE);
+  xTaskCreatePinnedToCore(Task_UpdateCore,"Task_UpdateCore",4096,NULL,1,NULL,ARDUINO_RUNNING_CORE);
+  // vTaskStartScheduler();
 }
  
 void loop() {
-  timeClient.update();
-  String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
-  double pressure = analogRead(27) * 0.033488372093 - 11.3860465116;
-  double volume = 2.663 * pulse / 1000 * 30;
-  if (millis() - lastTime > 2000) {
-    pulse = 0;
-    lastTime = millis();
-  }
-  StaticJsonDocument<200> docPR;
-  StaticJsonDocument<200> docWF;
-
-  docPR["timestamp"] = timeDateNowLoc;
-  docPR["node_id"] = NODEID;
-  docPR["sensor_id"] = SENSORID_PR;
-  docPR["value"] = pressure;
-
-  docWF["timestamp"] = timeDateNowLoc;
-  docWF["node_id"] = NODEID;
-  docWF["sensor_id"] = SENSORID_WF;
-  docWF["value"] = volume;
-
-  String jsonPRString;
-  serializeJson(docPR, jsonPRString);
-  String jsonWFString;
-  serializeJson(docWF, jsonWFString);
-  mqtt.update();
-  // mqtt.publish("sensorData", jsonString, false, 0);
-  Serial.print("MQTT Connected? ");
-  Serial.print(mqtt.isConnected());
-  Serial.print("\n");
-
-  Serial.println(jsonPRString);
-  Serial.println(jsonWFString);
-
-  delay(1000);
 }
 
 ICACHE_RAM_ATTR void increase() {
   pulse++;
+}
+
+void Task_ReadPressureSensor(void *pvParams) {
+  (void)pvParams;
+
+  while(1){
+    String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
+    double pressure = analogRead(PIN_PRESSENS) * 0.033488372093 - 11.3860465116;
+    StaticJsonDocument<200> docPR;
+
+    docPR["timestamp"] = timeDateNowLoc;
+    docPR["node_id"] = NODEID;
+    docPR["sensor_id"] = SENSORID_PR;
+    docPR["value"] = pressure;
+
+    String jsonPRString;
+    serializeJson(docPR, jsonPRString);
+    // mqtt.publish(pubTopic, jsonPRString, false, 0);
+    Serial.println(jsonPRString);
+    vTaskDelay( 2000 / portTICK_PERIOD_MS ); 
+  }
+}
+
+void Task_ReadWaterflowSensor(void *pvParams) {
+  (void)pvParams;
+
+  while(1) {
+    String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
+    double volume = 2.663 * pulse / 1000 * 30;
+    if (millis() - lastTime > 2000) {
+      pulse = 0;
+      lastTime = millis();
+    }
+    StaticJsonDocument<200> docWF;
+
+    docWF["timestamp"] = timeDateNowLoc;
+    docWF["node_id"] = NODEID;
+    docWF["sensor_id"] = SENSORID_WF;
+    docWF["value"] = volume;
+
+    String jsonWFString;
+    serializeJson(docWF, jsonWFString);
+    // mqtt.publish(pubTopic, jsonWFString, false, 0);
+    Serial.println(jsonWFString);
+    vTaskDelay( 2000 / portTICK_PERIOD_MS ); 
+  }
+}
+
+void Task_UpdateCore(void *pvParams) {
+  (void)pvParams;
+
+  while(1){
+    mqtt.update();
+    timeClient.update();
+    Serial.print("MQTT Connected? ");
+    Serial.print(mqtt.isConnected());
+    Serial.print("\n");
+    vTaskDelay( 500 / portTICK_PERIOD_MS ); 
+  }
+}
+
+int controlActuator(String subPayloadJSON) {
+  StaticJsonDocument<200> docPUMP;
+  DeserializationError error = deserializeJson(docPUMP, subPayloadJSON);
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
+    return 1;
+  }
+
+  String node_id = docPUMP["node_id"];
+  String actuator_id = docPUMP["actuator_id"];
+  String action = docPUMP["action"];
+  double value = docPUMP["value"];
+
+  if (node_id != String(NODEID) && actuator_id != String(ACTUATORID_PUMP)) {
+    Serial.println("Ignoring MQTT Message because mismatch target");
+    return 1;
+  }
+
+  pumpValue = value;
 }
