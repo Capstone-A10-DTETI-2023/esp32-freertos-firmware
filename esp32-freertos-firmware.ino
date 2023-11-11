@@ -16,6 +16,10 @@
 #define SENSORID_PR       1
 #define SENSORID_WF       2
 #define ACTUATORID_PUMP   1
+#define PRSENSORSAMPLING_INT_MS 100
+#define PRSENSORDATASEND_INT_MS 10000
+#define WFSENSORSAMPLING_INT_MS 1000
+#define WFSENSORDATASEND_INT_MS 10000
 
 // PIN NUM DEFINITION
 #define PIN_WFLWSENS  14
@@ -49,8 +53,8 @@ IPAddress mqttServer(207,2,123,118);
  
 // Enter a MAC address for your controller below.
 // Newer Ethernet shields have a MAC address printed on a sticker on the shield
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
- 
+byte mac[] = { 0xD8, 0x00, 0xDF, 0xEF, 0xFE, 0xED };
+
 // Set the static IP address to use if the DHCP fails to assign
 #define MYIPADDR 192,168,1,28
 #define MYIPMASK 255,255,255,0
@@ -69,11 +73,25 @@ unsigned long next;
 volatile long pulse;
 unsigned long lastTime;
 
-bool pumpState;
+String receiveJSON;
+bool pumpState = false;
 double pumpValue;
+
+double sumPressure = 0;
+double sumWaterFlow = 0;
 
 const char* SubTopic = "actuatorData";
 const char* PubTopic = "sensorData"; 
+
+const uint dataCountPress = PRSENSORDATASEND_INT_MS / PRSENSORSAMPLING_INT_MS;
+const uint dataCountWFlow = WFSENSORDATASEND_INT_MS / WFSENSORSAMPLING_INT_MS;
+
+static SemaphoreHandle_t xMutexPress;
+static SemaphoreHandle_t xSemaphorePress;
+static QueueHandle_t xQueuePress;
+static SemaphoreHandle_t xMutexWFlow;
+static SemaphoreHandle_t xSemaphoreWFlow;
+static QueueHandle_t xQueueWFlow;
 
 void setup() {
     Serial.begin(115200);
@@ -129,29 +147,36 @@ void setup() {
       Serial.print(".");
     }
     Serial.println("Connected to MQTT!");
-    mqtt.subscribe(SubTopic, [](const String & payload, const size_t size)
-    {
-      (void) size;
-
-      controlActuator(payload);
-    });
     timeClient.begin();
     timeClient.setTimeOffset(3600 * TIME_ZONE_OFFSET_HRS);
     // default 60000 => 60s. Set to once per hour
     timeClient.setUpdateInterval(SECS_IN_HR);
   
-    Serial.println("Using NTP Server " + timeClient.getPoolServerName());
+    Serial.println("Using NTP Server :" + timeClient.getPoolServerName());
   } else {
     // if you didn't get a connection to the server:
     Serial.println("connection failed");
   }
 
   pinMode(PIN_WFLWSENS, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_WFLWSENS), increase, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_WFLWSENS), increase, FALLING);
 
-  xTaskCreatePinnedToCore(Task_ReadPressureSensor,"Task_ReadPressureSensor",10240,NULL,1,NULL,ARDUINO_RUNNING_CORE);
-  xTaskCreatePinnedToCore(Task_ReadWaterflowSensor,"Task_ReadWaterflowSensor",10240,NULL,1,NULL,ARDUINO_RUNNING_CORE);
-  xTaskCreatePinnedToCore(Task_UpdateCore,"Task_UpdateCore",4096,NULL,1,NULL,ARDUINO_RUNNING_CORE);
+  double pressDataSum = 0;
+  double wFlowDataSum = 0;
+
+  timeClient.update();
+
+  xSemaphorePress = xSemaphoreCreateBinary();
+  xMutexPress = xSemaphoreCreateMutex();
+  xSemaphoreWFlow = xSemaphoreCreateBinary();
+  xMutexWFlow = xSemaphoreCreateMutex();
+
+  xTaskCreatePinnedToCore(Task_ReadPressureSensor,"Task_ReadPressureSensor",8192,(void *) &pressDataSum,1,NULL,ARDUINO_RUNNING_CORE);
+  xTaskCreatePinnedToCore(Task_ReadWaterflowSensor,"Task_ReadWaterflowSensor",8192,(void *) &wFlowDataSum,1,NULL,ARDUINO_RUNNING_CORE);
+  xTaskCreatePinnedToCore(Task_CalcAveragePressSens, "Task_CalcAveragePressSens",16384,(void *)  &pressDataSum,1,NULL,ARDUINO_RUNNING_CORE);
+  xTaskCreatePinnedToCore(Task_CalcAverageWFlowSens, "Task_CalcAverageWFlowSens",16384,(void *)  &pressDataSum,1,NULL,ARDUINO_RUNNING_CORE);
+  xTaskCreatePinnedToCore(Task_PIDPump, "Task_PIDPump",10240,NULL,1,NULL,ARDUINO_RUNNING_CORE);
+  xTaskCreatePinnedToCore(Task_UpdateCore,"Task_UpdateCore",16384,NULL,1,NULL,ARDUINO_RUNNING_CORE);
   // vTaskStartScheduler();
 }
  
@@ -163,82 +188,195 @@ ICACHE_RAM_ATTR void increase() {
 }
 
 void Task_ReadPressureSensor(void *pvParams) {
-  (void)pvParams;
+  double *pressDataSum = (double *)pvParams;
 
+  while(timeClient.getSeconds()%(PRSENSORDATASEND_INT_MS/1000) != 0) {
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
+
+  uint counter = 0;
   while(1){
-    String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
-    double pressure = analogRead(PIN_PRESSENS) * 0.033488372093 - 11.3860465116;
+    double pressure = analogRead(PIN_PRESSENS) * 0.05 - 11.5;
+    Serial.println("Current Pressure Sensor Data :" + String(pressure));
+    sumPressure += pressure;
+    counter++;
+    if(counter == dataCountPress-1){
+      counter = 0;
+      xSemaphoreGive(xSemaphorePress);
+    }
+    vTaskDelay( PRSENSORSAMPLING_INT_MS / portTICK_PERIOD_MS );
+  }
+}
+
+void Task_ReadWaterflowSensor(void *pvParams) {
+  double *wFlowDataSum = (double *)pvParams;
+  double flowRate;
+  unsigned int flowMilliLitres;
+  unsigned long oldTime;
+  uint counter = 0;
+
+  while(timeClient.getSeconds()%(WFSENSORDATASEND_INT_MS/1000) != 0) {
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
+
+  while(1) {
+    detachInterrupt(PIN_WFLWSENS);
+    flowRate = ((1000.0 / (millis() - oldTime)) * pulse) / 4.5;
+    oldTime = millis();
+    flowMilliLitres = (flowRate / 60) * 1000;
+    pulse = 0;
+    attachInterrupt(digitalPinToInterrupt(PIN_WFLWSENS), increase, FALLING);
+    sumWaterFlow += flowRate;
+    // Serial.println("Current Water Flow Sum Sensor Data :" + String(sumWaterFlow));
+    counter++;
+    // Serial.println("Counter Water Flow :" + String(counter));
+    if(counter == dataCountWFlow-1) {
+      counter = 0;
+      xSemaphoreGive(xSemaphoreWFlow);
+      vTaskDelay( 100 / portTICK_PERIOD_MS);
+    }
+    
+    vTaskDelay( WFSENSORSAMPLING_INT_MS / portTICK_PERIOD_MS ); 
+  }
+}
+
+void Task_CalcAveragePressSens(void *pvParams) {
+  String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
+  double *pressDataSum = (double *)pvParams;
+  double dataSum;
+  while(1) {
+    if (xSemaphoreTake(xSemaphorePress, portMAX_DELAY)){
+      dataSum = sumPressure;
+      sumPressure = 0;
+      xSemaphoreGive(xMutexPress);
+    }
+    double aveData = dataSum / (double)dataCountPress;
+    Serial.println("Pressure Sensor Average Data: " + String(aveData));
     StaticJsonDocument<200> docPR;
 
     docPR["timestamp"] = timeDateNowLoc;
     docPR["node_id"] = NODEID;
     docPR["sensor_id"] = SENSORID_PR;
-    docPR["value"] = pressure;
+    docPR["value"] = aveData;
 
     String jsonPRString;
     serializeJson(docPR, jsonPRString);
-    // mqtt.publish(pubTopic, jsonPRString, false, 0);
-    Serial.println(jsonPRString);
-    vTaskDelay( 2000 / portTICK_PERIOD_MS ); 
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
 
-void Task_ReadWaterflowSensor(void *pvParams) {
-  (void)pvParams;
-
-  while(1) {
-    String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
-    double volume = 2.663 * pulse / 1000 * 30;
-    if (millis() - lastTime > 2000) {
-      pulse = 0;
-      lastTime = millis();
+void Task_CalcAverageWFlowSens(void *pvParams) {
+  String timeDateNowLoc = String(timeClient.getYear()) + "-" + String(timeClient.getMonth()) + "-" + String(timeClient.getDay()) + " " + String(timeClient.getFormattedTime());
+  double *wFlowDataSum = (double *)pvParams;
+  double dataSum;
+  while(1){
+    if (xSemaphoreTake(xSemaphoreWFlow, portMAX_DELAY)){
+      dataSum = sumWaterFlow;
+      sumWaterFlow = 0;
     }
+    Serial.println("Water Flow Sum Data :" + String(dataSum));
+    double aveData = dataSum / (double)dataCountWFlow;
+    Serial.println("Water Flow Sensor Average Data: " + String(aveData));
     StaticJsonDocument<200> docWF;
 
     docWF["timestamp"] = timeDateNowLoc;
     docWF["node_id"] = NODEID;
     docWF["sensor_id"] = SENSORID_WF;
-    docWF["value"] = volume;
+    docWF["value"] = aveData;
 
     String jsonWFString;
     serializeJson(docWF, jsonWFString);
-    // mqtt.publish(pubTopic, jsonWFString, false, 0);
-    Serial.println(jsonWFString);
-    vTaskDelay( 2000 / portTICK_PERIOD_MS ); 
   }
 }
 
 void Task_UpdateCore(void *pvParams) {
   (void)pvParams;
 
+  mqtt.subscribe(SubTopic, [](const String & payload, const size_t size)
+  {
+    (void) size;
+    receiveJSON = payload;
+    Serial.println(receiveJSON);
+    StaticJsonDocument<200> docPUMP;
+    DeserializationError error = deserializeJson(docPUMP, receiveJSON);
+    if (error) {
+      Serial.print(F("deserializeJson() failed: "));
+      Serial.println(error.f_str());
+    }
+
+    String node_id = docPUMP["node_id"];
+    String actuator_id = docPUMP["actuator_id"];
+    String action = docPUMP["action"];
+    double value = docPUMP["value"];
+
+    if (node_id != String(NODEID) && actuator_id != String(ACTUATORID_PUMP)) {
+      Serial.println("Ignoring MQTT Message because mismatch target");
+    } else {
+      if (action == "on" || action == "ON") {
+        pumpState = true;
+      } else if (action == "off" || action == "OFF") {
+        pumpState = false;
+      }
+      pumpValue = value;
+      Serial.println("New pump value: " + String(pumpValue));
+    }
+  });
+
   while(1){
     mqtt.update();
     timeClient.update();
-    Serial.print("MQTT Connected? ");
-    Serial.print(mqtt.isConnected());
-    Serial.print("\n");
+    // Serial.print("MQTT Connected? ");
+    // Serial.print(mqtt.isConnected());
+    // Serial.print("\n");
     vTaskDelay( 500 / portTICK_PERIOD_MS ); 
   }
 }
 
-int controlActuator(String subPayloadJSON) {
-  StaticJsonDocument<200> docPUMP;
-  DeserializationError error = deserializeJson(docPUMP, subPayloadJSON);
-  if (error) {
-    Serial.print(F("deserializeJson() failed: "));
-    Serial.println(error.f_str());
-    return 1;
+void Task_PIDPump(void *pvParams){
+  (void)pvParams;
+  double sensed_output, control_signal, setpoint;
+  double previous_error = 0.0;
+  double Kp = 1;
+  double Ki = 0.1;
+  double Kd = 0.1;
+  double PID_error, PID_value, elapsedTime, Time, timePrev;
+  double PID_p, PID_i, PID_d;
+
+  Time = millis();
+  setpoint = pumpValue;
+
+  while(1){
+    // Serial.println("Current pump state :" + String(pumpState));
+    while(pumpState == false) {
+      Serial.println("Current pump state :" + String(pumpState));
+      analogWrite(PIN_PUMPACT, 0);
+      vTaskDelay(1500 / portTICK_PERIOD_MS);
+    }
+
+    sensed_output = analogRead(PIN_PRESSENS) * 0.033488372093 - 11.3860465116;
+    // Serial.println("Current sensed output PID :" + String(sensed_output));
+    // Serial.println("Current setpoint :" + String(setpoint));
+    PID_error = setpoint - sensed_output;
+    PID_p = Kp * PID_error;
+
+    if (-3 < PID_error < 3) {
+      PID_i = PID_i + (Ki + PID_error);
+    }
+
+    timePrev = Time;
+    Time = millis();
+    elapsedTime = (Time - timePrev) / 1000;
+    PID_d = Kd*((PID_error - previous_error)/elapsedTime);
+    PID_value = PID_p + PID_i + PID_d;
+    if(PID_value < 0){
+      PID_value = 0;
+    }
+    if(PID_value > 255){
+      PID_value = 255;
+    }
+
+    analogWrite(PIN_PUMPACT,255-PID_value);
+    previous_error = PID_error;
+    vTaskDelay(500 / portTICK_PERIOD_MS);
   }
-
-  String node_id = docPUMP["node_id"];
-  String actuator_id = docPUMP["actuator_id"];
-  String action = docPUMP["action"];
-  double value = docPUMP["value"];
-
-  if (node_id != String(NODEID) && actuator_id != String(ACTUATORID_PUMP)) {
-    Serial.println("Ignoring MQTT Message because mismatch target");
-    return 1;
-  }
-
-  pumpValue = value;
 }
