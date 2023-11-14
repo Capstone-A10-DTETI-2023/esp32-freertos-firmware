@@ -12,7 +12,7 @@
  **/
  
 // NODE CONFIG
-#define NODEID            3
+#define NODEID            2
 #define PRSENSORSAMPLING_INT_MS 100
 #define PRSENSORDATASEND_INT_MS 10000
 #define WFSENSORSAMPLING_INT_MS 1000
@@ -23,21 +23,25 @@
   const int SENSORID_WF = 5;
   const int ACTUATORID_PUMP = 1;
   byte mac[] = { 0xD8, 0x00, 0xDF, 0xEF, 0xFE, 0x01 }; // node 1
+  String clientId = "capstone_a10_node1";
 #elif NODEID == 2
   const int SENSORID_PR = 2;
   const int SENSORID_WF = 6;
   const int ACTUATORID_PUMP = 2;
   byte mac[] = { 0xD8, 0x00, 0xDF, 0xEF, 0xFE, 0x02 }; // node 2
+  String clientId = "capstone_a10_node2";
 #elif NODEID == 3
   const int SENSORID_PR = 3;
   const int SENSORID_WF = 7;
   const int ACTUATORID_PUMP = 3;
   byte mac[] = { 0xD8, 0x00, 0xDF, 0xEF, 0xFE, 0x03 }; // node 3
+  String clientId = "capstone_a10_node3";
 #elif NODEID == 4
   const int SENSORID_PR = 4;
   const int SENSORID_WF = 8;
   const int ACTUATORID_PUMP = 4;
   byte mac[] = { 0xD8, 0x00, 0xDF, 0xEF, 0xFE, 0x04 }; // node 4
+  String clientId = "capstone_a10_node4";
 #endif
 
 // PIN NUM DEFINITION
@@ -156,7 +160,6 @@ void setup() {
    delay(50);
   // if you get a connection, report back via serial:
   if (ethClient.connect(mqttServer, 1883)) {
-    String clientId = "capstone_a10_" + String(rand());
     Serial.println("Connected!");
     mqtt.begin(ethClient);
     mqtt.connect(clientId, "node", "38t8b4HVHG2cfNr6");
